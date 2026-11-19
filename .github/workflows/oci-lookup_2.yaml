@@ -1,0 +1,50 @@
+name: oci-lookup
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Operating system (e.g. "Canonical Ubuntu", "Oracle Linux")'
+        default: 'Canonical Ubuntu'
+      version:
+        description: 'OS version (e.g. "24.04", "9")'
+        default: '24.04'
+
+# This workflow never needs access to this repository, so give the token no rights.
+permissions: {}
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.12.16-slim
+    env:
+      IMAGE_OS: ${{ inputs.os }}
+      IMAGE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Setup OCI CLI
+        run: pip install --no-cache-dir oci-cli==3.96.3
+
+      - name: Write OCI config
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_CONFIG" > ~/.oci/config
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          # Default region, used only when OCI_CONFIG has no region= line.
+          grep -q '^region' ~/.oci/config || echo "region=eu-frankfurt-1" >> ~/.oci/config
+          chmod 600 ~/.oci/config ~/.oci/oci_api_key.pem
+
+      - name: List ARM images
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+        run: |
+          oci compute image list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --operating-system "$IMAGE_OS" \
+            --operating-system-version "$IMAGE_VERSION" \
+            --shape "VM.Standard.A1.Flex" \
+            --query 'data[*].{name:"display-name", id:id}' \
+            --output table
