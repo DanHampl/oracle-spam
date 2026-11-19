@@ -3,7 +3,7 @@ name: oci-capacity-retry
 on:
   # To retry automatically, uncomment the schedule lines below.
   schedule:
-    - cron: '13,43 * * * *'
+    - cron: '13,28,43,58 * * * *'
   workflow_dispatch: {}
 
 # This workflow never needs access to this repository, so give the token no rights.
