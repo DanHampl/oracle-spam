@@ -1,0 +1,121 @@
+name: oci-capacity-retry
+
+on:
+  # To retry automatically, uncomment the schedule lines below.
+  # schedule:
+  #   - cron: '13,28,43,58 * * * *'
+  workflow_dispatch: {}
+
+# This workflow never needs access to this repository, so give the token no rights.
+permissions: {}
+
+# Never run two launches at once (manual + scheduled), to avoid duplicate instances.
+concurrency:
+  group: oci-capacity-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.12.16-slim
+    env:
+      INSTANCE_NAME: ${{ secrets.OCI_INSTANCE_NAME || 'my-server' }}
+    steps:
+      - name: Setup OCI CLI
+        run: pip install --no-cache-dir oci-cli==3.96.3
+
+      - name: Write OCI config
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_CONFIG" > ~/.oci/config
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          # Default region, used only when OCI_CONFIG has no region= line.
+          grep -q '^region' ~/.oci/config || echo "region=eu-frankfurt-1" >> ~/.oci/config
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > ~/ssh_key.pub
+          chmod 600 ~/.oci/config ~/.oci/oci_api_key.pem
+
+      - name: Skip if instance already exists
+        id: check
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+        run: |
+          # An API error must NOT be treated as "no instance", or we could create a duplicate.
+          if ! oci compute instance list \
+                --compartment-id "$COMPARTMENT_ID" \
+                --display-name "$INSTANCE_NAME" \
+                --all --output json > /tmp/instances.json 2> /tmp/err.txt; then
+            echo "OCI API error while checking for an existing instance. Next run retries."
+            grep -E '"(code|message)"' /tmp/err.txt || tail -n 3 /tmp/err.txt
+            exit 1
+          fi
+          # Any instance that is not terminated counts as existing (also stopped or still provisioning).
+          COUNT=$(python3 -c "
+          import json
+          raw = open('/tmp/instances.json').read().strip()
+          data = json.loads(raw)['data'] if raw else []
+          alive = {'PROVISIONING', 'RUNNING', 'STARTING', 'STOPPING', 'STOPPED'}
+          print(sum(1 for i in data if i['lifecycle-state'] in alive))
+          ")
+          echo "Existing instances named '$INSTANCE_NAME': $COUNT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Try launch in each AD
+        if: steps.check.outputs.count == '0'
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+        run: |
+          # Only error codes are printed, never IDs or names, so logs stay safe in a public repo.
+          TENANCY=$(grep '^tenancy' ~/.oci/config | cut -d= -f2 | tr -d ' ')
+          if ! oci iam availability-domain list \
+                --compartment-id "$TENANCY" \
+                --query 'data[].name' > /tmp/ads.json 2> /tmp/err.txt; then
+            echo "Availability domain lookup failed. Next run retries."
+            grep -E '"(code|message)"' /tmp/err.txt || tail -n 3 /tmp/err.txt
+            exit 1
+          fi
+          ADS=$(python3 -c "import json; print(' '.join(json.load(open('/tmp/ads.json'))))")
+          TOTAL=$(echo "$ADS" | wc -w)
+          if [ "$TOTAL" -eq 0 ]; then echo "No availability domains found"; exit 1; fi
+          N=0
+          for AD in $ADS; do
+            N=$((N + 1))
+            echo "Trying availability domain $N of $TOTAL"
+            if oci compute instance launch \
+                  --compartment-id "$COMPARTMENT_ID" \
+                  --availability-domain "$AD" \
+                  --shape "VM.Standard.A1.Flex" \
+                  --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                  --subnet-id "$SUBNET_ID" \
+                  --image-id "$IMAGE_ID" \
+                  --assign-public-ip true \
+                  --ssh-authorized-keys-file ~/ssh_key.pub \
+                  --display-name "$INSTANCE_NAME" > /tmp/launch.json 2> /tmp/err.txt; then
+              echo "Instance launch accepted."
+              exit 0
+            fi
+            grep -E '"(code|message)"' /tmp/err.txt || tail -n 3 /tmp/err.txt
+          done
+          echo "No availability domain has capacity"
+          exit 1
+
+      - name: Notify on success
+        if: success() && steps.check.outputs.count == '0'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then echo "NTFY_TOPIC not set, skipping notification"; exit 0; fi
+          python3 -c "
+          import os, urllib.request
+          urllib.request.urlopen(urllib.request.Request(
+              'https://ntfy.sh/' + os.environ['NTFY_TOPIC'],
+              data=b'OCI instance created successfully!',
+              method='POST'
+          ))
+          "
